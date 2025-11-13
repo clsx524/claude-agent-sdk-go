@@ -245,7 +245,12 @@ options := &claude.ClaudeAgentOptions{
     ForkSession:          true,
 
     // Model selection
-    Model: stringPtr("claude-sonnet-4-5"),
+    Model:         stringPtr("claude-sonnet-4-5"),
+    FallbackModel: stringPtr("claude-sonnet-3-5"), // Fallback if primary unavailable
+
+    // Budget and token control
+    MaxBudgetUSD:      floatPtr(1.0),  // Maximum spending limit in USD
+    MaxThinkingTokens: intPtr(10000),  // Maximum extended thinking tokens
 
     // Permission mode
     PermissionMode: &permissionMode, // "default", "acceptEdits", "bypassPermissions"
@@ -262,6 +267,14 @@ options := &claude.ClaudeAgentOptions{
     // Settings
     Settings:       stringPtr("/path/to/settings.json"),
     SettingSources: []claude.SettingSource{claude.SettingSourceUser, claude.SettingSourceProject},
+
+    // Plugins
+    Plugins: []claude.SdkPluginConfig{
+        {
+            Type: "local",
+            Path: "/path/to/plugin",
+        },
+    },
 
     // Custom agents
     Agents: map[string]claude.AgentDefinition{
@@ -355,10 +368,25 @@ Error types:
 
 See the [examples](examples/) directory for complete working examples:
 
+### Getting Started
 - **[quickstart](examples/quickstart/main.go)** - Basic query usage
 - **[streaming](examples/streaming/main.go)** - Multi-turn conversations with ClaudeSDKClient
+
+### Advanced Features
 - **[mcp_tools](examples/mcp_tools/main.go)** - Custom in-process tools
 - **[hooks](examples/hooks/main.go)** - Hook system for control and interception
+- **[tool_permission_callback](examples/tool_permission_callback/main.go)** - Control tool permissions
+- **[agents](examples/agents/main.go)** - Define and use custom agents
+
+### Configuration
+- **[max_budget_usd](examples/max_budget_usd/main.go)** - Set maximum spending limits
+- **[plugin_example](examples/plugin_example/main.go)** - Load custom plugins
+- **[setting_sources](examples/setting_sources/main.go)** - Control which settings are loaded
+- **[system_prompt](examples/system_prompt/main.go)** - Different system prompt configurations
+
+### Streaming & Callbacks
+- **[include_partial_messages](examples/include_partial_messages/main.go)** - Stream partial updates
+- **[stderr_callback](examples/stderr_callback/main.go)** - Capture debug output
 
 Run examples:
 ```bash

@@ -159,6 +159,57 @@ func TestParseAssistantMessage(t *testing.T) {
 	}
 }
 
+func TestParseImageBlock(t *testing.T) {
+	// Test image block in assistant message
+	data := map[string]interface{}{
+		"type": "assistant",
+		"message": map[string]interface{}{
+			"role":  "assistant",
+			"model": "claude-sonnet-4-5",
+			"content": []interface{}{
+				map[string]interface{}{
+					"type": "text",
+					"text": "Here's the image:",
+				},
+				map[string]interface{}{
+					"type":     "image",
+					"data":     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+					"mimeType": "image/png",
+				},
+			},
+		},
+	}
+
+	msg, err := claude.ParseMessage(data)
+	if err != nil {
+		t.Fatalf("ParseMessage failed: %v", err)
+	}
+
+	assistantMsg, ok := msg.(*claude.AssistantMessage)
+	if !ok {
+		t.Fatalf("expected *AssistantMessage, got %T", msg)
+	}
+
+	if len(assistantMsg.Content) != 2 {
+		t.Fatalf("expected 2 content blocks, got %d", len(assistantMsg.Content))
+	}
+
+	// Check image block
+	imageBlock, ok := assistantMsg.Content[1].(claude.ImageBlock)
+	if !ok {
+		t.Fatalf("expected ImageBlock, got %T", assistantMsg.Content[1])
+	}
+
+	expectedData := "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+	if imageBlock.Data != expectedData {
+		t.Errorf("expected data '%s', got %s", expectedData, imageBlock.Data)
+	}
+
+	if imageBlock.MimeType != "image/png" {
+		t.Errorf("expected mimeType 'image/png', got %s", imageBlock.MimeType)
+	}
+}
+
 func TestParseResultMessage(t *testing.T) {
 	data := map[string]interface{}{
 		"type":            "result",
@@ -289,5 +340,76 @@ func TestParseMessageErrors(t *testing.T) {
 				t.Error("expected error, got nil")
 			}
 		})
+	}
+}
+
+func TestParseUserMessageWithMixedContent(t *testing.T) {
+	// Test parsing user messages with mixed content blocks (text + tool_result)
+	// This is a common pattern and should be handled correctly
+	data := map[string]interface{}{
+		"type": "user",
+		"message": map[string]interface{}{
+			"role": "user",
+			"content": []interface{}{
+				map[string]interface{}{
+					"type": "text",
+					"text": "Here's the file content:",
+				},
+				map[string]interface{}{
+					"type":        "tool_result",
+					"tool_use_id": "toolu_123",
+					"content":     "File contents here",
+				},
+				map[string]interface{}{
+					"type": "text",
+					"text": "What do you think?",
+				},
+			},
+		},
+	}
+
+	msg, err := claude.ParseMessage(data)
+	if err != nil {
+		t.Fatalf("ParseMessage failed: %v", err)
+	}
+
+	userMsg, ok := msg.(*claude.UserMessage)
+	if !ok {
+		t.Fatalf("expected *UserMessage, got %T", msg)
+	}
+
+	// Content should be array of blocks
+	contentBlocks, ok := userMsg.Content.([]claude.ContentBlock)
+	if !ok {
+		t.Fatalf("expected content to be []ContentBlock, got %T", userMsg.Content)
+	}
+
+	if len(contentBlocks) != 3 {
+		t.Errorf("expected 3 content blocks, got %d", len(contentBlocks))
+	}
+}
+
+func TestParseMessagePreservesErrorData(t *testing.T) {
+	// Test that parse errors contain the original data for debugging
+	data := map[string]interface{}{
+		"type":    "user",
+		"message": "invalid", // Should be a map, not a string
+	}
+
+	_, err := claude.ParseMessage(data)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	// Error should be a MessageParseError
+	parseErr, ok := err.(*claude.MessageParseError)
+	if !ok {
+		t.Fatalf("expected *MessageParseError, got %T", err)
+	}
+
+	// Error message should contain useful debugging information
+	errMsg := parseErr.Error()
+	if errMsg == "" {
+		t.Error("error message should not be empty")
 	}
 }

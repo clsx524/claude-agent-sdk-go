@@ -174,6 +174,17 @@ func parseContentBlock(item interface{}) (ContentBlock, error) {
 		}
 		return result, nil
 
+	case "image":
+		data, ok := block["data"].(string)
+		if !ok {
+			return nil, fmt.Errorf("image block missing 'data' field")
+		}
+		mimeType, ok := block["mimeType"].(string)
+		if !ok {
+			return nil, fmt.Errorf("image block missing 'mimeType' field")
+		}
+		return ImageBlock{Data: data, MimeType: mimeType}, nil
+
 	default:
 		return nil, fmt.Errorf("unknown content block type: %s", blockType)
 	}

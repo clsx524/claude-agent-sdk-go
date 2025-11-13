@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-
 )
 
 // ClaudeSDKClient provides bidirectional, interactive conversations with Claude Code.
@@ -25,17 +24,17 @@ import (
 //	client := NewClaudeSDKClient(nil)
 //	ctx := context.Background()
 //
-//	if err := client.Connect(ctx, nil); err != nil {
+//	if err := client.Connect(ctx); err != nil {
 //	    log.Fatal(err)
 //	}
-//	defer client.Disconnect()
+//	defer client.Close()
 //
-//	if err := client.Query(ctx, "Hello Claude", "default"); err != nil {
-//	    log.Fatal(err)
-//	}
-//
-//	for msg := range client.ReceiveResponse(ctx) {
+//	msgCh, errCh := client.Query(ctx, "Hello Claude")
+//	for msg := range msgCh {
 //	    fmt.Printf("%+v\n", msg)
+//	}
+//	if err := <-errCh; err != nil {
+//	    log.Fatal(err)
 //	}
 type ClaudeSDKClient struct {
 	options         *ClaudeAgentOptions
@@ -44,6 +43,7 @@ type ClaudeSDKClient struct {
 	queryHandler    *queryHandler
 	ctx             context.Context
 	cancel          context.CancelFunc
+	currentSession  string // Auto-managed session ID
 }
 
 // NewClaudeSDKClient creates a new Claude SDK client.
@@ -71,11 +71,37 @@ func NewClaudeSDKClientWithTransport(options *ClaudeAgentOptions, trans Transpor
 
 // Connect establishes connection to Claude Code.
 //
+// This method initializes the connection without sending any prompt.
+// Use Query() to send messages after connecting.
+//
+// Example:
+//
+//	client := claude.NewClaudeSDKClient(nil)
+//	ctx := context.Background()
+//
+//	if err := client.Connect(ctx); err != nil {
+//	    log.Fatal(err)
+//	}
+//	defer client.Close()
+//
+//	// Now ready to send queries
+//	msgCh, errCh := client.Query(ctx, "Hello!")
+//	for msg := range msgCh {
+//	    // Process messages
+//	}
+func (c *ClaudeSDKClient) Connect(ctx context.Context) error {
+	return c.ConnectWithPrompt(ctx, nil)
+}
+
+// ConnectWithPrompt establishes connection to Claude Code with an initial prompt.
+//
 // The prompt parameter can be:
 //   - nil: Empty connection for interactive use
 //   - string: Initial prompt message
 //   - <-chan map[string]interface{}: Stream of input messages
-func (c *ClaudeSDKClient) Connect(ctx context.Context, prompt interface{}) error {
+//
+// For most cases, use Connect() and then Query() instead.
+func (c *ClaudeSDKClient) ConnectWithPrompt(ctx context.Context, prompt interface{}) error {
 	os.Setenv("CLAUDE_CODE_ENTRYPOINT", "sdk-go-client")
 
 	// Create cancellable context
@@ -84,28 +110,17 @@ func (c *ClaudeSDKClient) Connect(ctx context.Context, prompt interface{}) error
 	// Determine actual prompt (empty channel if nil)
 	actualPrompt := prompt
 	if actualPrompt == nil {
-		emptyCh := make(chan map[string]interface{})
-		close(emptyCh)
+		ch := make(chan map[string]interface{})
+		close(ch)
+		var emptyCh <-chan map[string]interface{} = ch
 		actualPrompt = emptyCh
 	}
 
 	// Validate and configure permission settings
-	options := c.options
-	if c.options.CanUseTool != nil {
-		// canUseTool requires streaming mode
-		if _, isString := prompt.(string); isString {
-			return fmt.Errorf("can_use_tool callback requires streaming mode")
-		}
-
-		if c.options.PermissionPromptToolName != nil {
-			return fmt.Errorf("can_use_tool callback cannot be used with permission_prompt_tool_name")
-		}
-
-		// Set permission_prompt_tool_name to "stdio"
-		stdio := "stdio"
-		newOpts := *c.options
-		newOpts.PermissionPromptToolName = &stdio
-		options = &newOpts
+	_, isString := prompt.(string)
+	options, err := validateAndConfigurePermissions(c.options, !isString)
+	if err != nil {
+		return err
 	}
 
 	// Use provided transport or create subprocess transport
@@ -123,12 +138,13 @@ func (c *ClaudeSDKClient) Connect(ctx context.Context, prompt interface{}) error
 		return err
 	}
 
-	// Extract SDK MCP servers
-	sdkMcpServers := make(map[string]interface{})
-	for name, config := range c.options.McpServers {
-		if sdkConfig, ok := config.(McpSdkServerConfig); ok {
-			sdkMcpServers[name] = sdkConfig.Instance
-		}
+	// Extract SDK MCP servers using helper function
+	sdkMcpServers := extractSdkMcpServers(c.options.McpServers)
+
+	// Determine buffer size
+	bufferSize := 100 // default
+	if options.MessageChannelBufferSize != nil && *options.MessageChannelBufferSize > 0 {
+		bufferSize = *options.MessageChannelBufferSize
 	}
 
 	// Create queryHandler - ClaudeSDKClient always uses streaming mode
@@ -138,6 +154,7 @@ func (c *ClaudeSDKClient) Connect(ctx context.Context, prompt interface{}) error
 		options.CanUseTool,
 		options.Hooks,
 		sdkMcpServers,
+		bufferSize,
 	)
 
 	// Start reading messages
@@ -164,6 +181,10 @@ func (c *ClaudeSDKClient) Connect(ctx context.Context, prompt interface{}) error
 //
 // Returns a channel that yields messages until the client is disconnected
 // or an error occurs.
+//
+// IMPORTANT: Only ONE goroutine should call ReceiveMessages() to avoid competing
+// readers on the underlying queryHandler channel. For multi-query workflows,
+// use Query() which properly manages message distribution.
 func (c *ClaudeSDKClient) ReceiveMessages(ctx context.Context) <-chan Message {
 	msgCh := make(chan Message, 10)
 
@@ -201,10 +222,93 @@ func (c *ClaudeSDKClient) ReceiveMessages(ctx context.Context) <-chan Message {
 	return msgCh
 }
 
-// Query sends a new user message in streaming mode.
+// Query sends a new user message and returns channels for receiving responses.
 //
+// IMPORTANT: For multi-query workflows (calling Query() multiple times), you MUST
+// fully consume the returned channels before calling Query() again. Otherwise, use
+// the Python-style pattern: call QueryWithSession() to send, then call ReceiveResponse()
+// or ReceiveMessages() directly to receive.
+//
+// The returned channels will receive ALL messages (not just for this query) until a
+// ResultMessage is received. If you need finer control, use QueryWithSession() +
+// ReceiveResponse() separately.
+//
+// Returns:
+//   - Message channel: Receives messages until ResultMessage
+//   - Error channel: Receives any errors that occur
+//
+// Example - Single query:
+//
+//	msgCh, errCh := client.Query(ctx, "Hello Claude")
+//	for msg := range msgCh {
+//	    // Process message
+//	}
+//	if err := <-errCh; err != nil {
+//	    // Handle error
+//	}
+//
+// Example - Multiple queries (Python-style):
+//
+//	// First query
+//	client.QueryWithSession(ctx, "What is 2+2?", "default")
+//	for msg := range client.ReceiveResponse(ctx) {
+//	    // Process first response
+//	}
+//	// Second query
+//	client.QueryWithSession(ctx, "What is 3+3?", "default")
+//	for msg := range client.ReceiveResponse(ctx) {
+//	    // Process second response
+//	}
+func (c *ClaudeSDKClient) Query(ctx context.Context, prompt string) (<-chan Message, <-chan error) {
+	// Auto-generate session ID if not set
+	if c.currentSession == "" {
+		c.currentSession = "default"
+	}
+
+	// Send the query
+	err := c.QueryWithSession(ctx, prompt, c.currentSession)
+	if err != nil {
+		// Return channels with error
+		msgCh := make(chan Message)
+		errCh := make(chan error, 1)
+		close(msgCh)
+		errCh <- err
+		close(errCh)
+		return msgCh, errCh
+	}
+
+	// Return the shared response channel directly
+	// This matches Python's behavior where multiple query() calls share the same receive_response()
+	return c.wrapReceiveResponseWithError(ctx)
+}
+
+// wrapReceiveResponseWithError wraps ReceiveResponse to also return an error channel
+func (c *ClaudeSDKClient) wrapReceiveResponseWithError(ctx context.Context) (<-chan Message, <-chan error) {
+	msgCh := make(chan Message, 10)
+	errCh := make(chan error, 1)
+
+	go func() {
+		defer close(msgCh)
+		defer close(errCh)
+
+		for msg := range c.ReceiveResponse(ctx) {
+			select {
+			case msgCh <- msg:
+			case <-ctx.Done():
+				errCh <- ctx.Err()
+				return
+			}
+		}
+	}()
+
+	return msgCh, errCh
+}
+
+// QueryWithSession sends a new user message with an explicit session ID.
+//
+// For most cases, use Query() which auto-manages session IDs.
 // The prompt can be either a string or <-chan map[string]interface{}.
-func (c *ClaudeSDKClient) Query(ctx context.Context, prompt interface{}, sessionID string) error {
+func (c *ClaudeSDKClient) QueryWithSession(ctx context.Context, prompt interface{}, sessionID string) error {
 	if c.queryHandler == nil || c.transport == nil {
 		return NewCLIConnectionError("not connected. Call Connect() first", nil)
 	}
@@ -242,6 +346,21 @@ func (c *ClaudeSDKClient) Query(ctx context.Context, prompt interface{}, session
 }
 
 // Interrupt sends interrupt signal (only works with streaming mode).
+//
+// Example:
+//
+//	client := claude.NewClaudeSDKClient(nil)
+//	ctx := context.Background()
+//	client.Connect(ctx)
+//	defer client.Close()
+//
+//	// Start a long-running query
+//	go client.Query(ctx, "Analyze this entire codebase...")
+//
+//	// User decides to cancel
+//	if err := client.Interrupt(ctx); err != nil {
+//	    log.Printf("Failed to interrupt: %v", err)
+//	}
 func (c *ClaudeSDKClient) Interrupt(ctx context.Context) error {
 	if c.queryHandler == nil {
 		return NewCLIConnectionError("not connected. Call Connect() first", nil)
@@ -295,15 +414,20 @@ func (c *ClaudeSDKClient) ReceiveResponse(ctx context.Context) <-chan Message {
 	go func() {
 		defer close(msgCh)
 
-		for msg := range c.ReceiveMessages(ctx) {
+		// Create a cancellable context so we can stop ReceiveMessages when done
+		receiveCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
+		for msg := range c.ReceiveMessages(receiveCtx) {
 			select {
 			case msgCh <- msg:
 			case <-ctx.Done():
 				return
 			}
 
-			// Stop after ResultMessage
+			// Stop after ResultMessage and cancel the context to stop ReceiveMessages
 			if _, ok := msg.(*ResultMessage); ok {
+				cancel()
 				return
 			}
 		}
@@ -312,7 +436,17 @@ func (c *ClaudeSDKClient) ReceiveResponse(ctx context.Context) <-chan Message {
 	return msgCh
 }
 
+// Close closes the connection to Claude Code.
+//
+// This is the preferred method name for Python API compatibility.
+// It's an alias for Disconnect().
+func (c *ClaudeSDKClient) Close() error {
+	return c.Disconnect()
+}
+
 // Disconnect closes the connection to Claude Code.
+//
+// Prefer using Close() for consistency with Python SDK.
 func (c *ClaudeSDKClient) Disconnect() error {
 	if c.cancel != nil {
 		c.cancel()

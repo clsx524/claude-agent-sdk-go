@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"sync"
 	"time"
-
 )
 
 // queryHandler handles bidirectional control protocol on top of Transport.
@@ -34,11 +33,6 @@ type queryHandler struct {
 	initResult  map[string]interface{}
 }
 
-type hookMatcherInternal struct {
-	Matcher string
-	Hooks   []HookCallback
-}
-
 type controlResult struct {
 	response map[string]interface{}
 	err      error
@@ -51,18 +45,14 @@ func newQueryHandler(
 	canUseTool CanUseTool,
 	hooks map[HookEvent][]HookMatcher,
 	sdkMcpServers map[string]interface{},
+	bufferSize int,
 ) *queryHandler {
-	// Convert hooks to internal format
-	internalHooks := make(map[string][]hookMatcherInternal)
-	for event, matchers := range hooks {
-		internal := make([]hookMatcherInternal, len(matchers))
-		for i, m := range matchers {
-			internal[i] = hookMatcherInternal{
-				Matcher: m.Matcher,
-				Hooks:   m.Hooks,
-			}
-		}
-		internalHooks[string(event)] = internal
+	// Convert hooks to internal format using helper function
+	internalHooks := convertHooksToInternal(hooks)
+
+	// Use default buffer size if not specified or invalid
+	if bufferSize <= 0 {
+		bufferSize = 100
 	}
 
 	return &queryHandler{
@@ -73,7 +63,7 @@ func newQueryHandler(
 		sdkMcpServers:           sdkMcpServers,
 		pendingControlResponses: make(map[string]chan controlResult),
 		hookCallbacks:           make(map[string]HookCallback),
-		messageChan:             make(chan map[string]interface{}, 100),
+		messageChan:             make(chan map[string]interface{}, bufferSize),
 		errorChan:               make(chan error, 1),
 	}
 }
@@ -314,7 +304,7 @@ func (q *queryHandler) handleCanUseTool(ctx context.Context, request map[string]
 	}
 
 	toolName, _ := request["tool_name"].(string)
-	input, _ := request["tool_input"].(map[string]interface{})
+	originalInput, _ := request["input"].(map[string]interface{})
 	suggestions, _ := request["permission_suggestions"].([]interface{})
 
 	// Convert suggestions
@@ -330,24 +320,37 @@ func (q *queryHandler) handleCanUseTool(ctx context.Context, request map[string]
 		Suggestions: permSuggestions,
 	}
 
-	result, err := q.canUseTool(ctx, toolName, input, permCtx)
+	result, err := q.canUseTool(ctx, toolName, originalInput, permCtx)
 	if err != nil {
 		return nil, err
 	}
 
-	// Convert result to response format
+	// Convert result to response format matching Python SDK
 	switch r := result.(type) {
 	case PermissionResultAllow:
-		response := map[string]interface{}{"allow": true}
+		// Use JSON marshaling to ensure proper field names (behavior, updatedInput, updatedPermissions)
+		response := map[string]interface{}{
+			"behavior": "allow",
+		}
+		// Use updatedInput if provided, otherwise use original input
 		if r.UpdatedInput != nil {
-			response["input"] = r.UpdatedInput
+			response["updatedInput"] = r.UpdatedInput
+		} else {
+			response["updatedInput"] = originalInput
+		}
+		if r.UpdatedPermissions != nil && len(r.UpdatedPermissions) > 0 {
+			response["updatedPermissions"] = r.UpdatedPermissions
 		}
 		return response, nil
 	case PermissionResultDeny:
-		return map[string]interface{}{
-			"allow":  false,
-			"reason": r.Message,
-		}, nil
+		response := map[string]interface{}{
+			"behavior": "deny",
+			"message":  r.Message,
+		}
+		if r.Interrupt {
+			response["interrupt"] = r.Interrupt
+		}
+		return response, nil
 	default:
 		return nil, fmt.Errorf("invalid permission result type")
 	}
@@ -374,16 +377,15 @@ func (q *queryHandler) handleHookCallback(ctx context.Context, request map[strin
 		return nil, err
 	}
 
-	// Convert HookJSONOutput to map
-	response := make(map[string]interface{})
-	if result.Decision != nil {
-		response["decision"] = *result.Decision
+	// Convert HookJSONOutput to map using JSON marshaling to ensure all fields
+	// are properly serialized with correct JSON tags (e.g., "continue", "async")
+	var response map[string]interface{}
+	resultJSON, err := json.Marshal(result)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal hook result: %w", err)
 	}
-	if result.SystemMessage != nil {
-		response["systemMessage"] = *result.SystemMessage
-	}
-	if result.HookSpecificOutput != nil {
-		response["hookSpecificOutput"] = result.HookSpecificOutput
+	if err := json.Unmarshal(resultJSON, &response); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal hook result: %w", err)
 	}
 
 	return response, nil

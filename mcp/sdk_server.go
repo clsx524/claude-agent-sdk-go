@@ -350,7 +350,11 @@ func (s *SdkMcpServer) typeToSchema(t reflect.Type) map[string]interface{} {
 	}
 }
 
-// Example helper to create text content
+// TextContent creates a response with text content.
+//
+// Example:
+//
+//	return mcp.TextContent("The answer is 42")
 func TextContent(text string) map[string]interface{} {
 	return map[string]interface{}{
 		"content": []map[string]interface{}{
@@ -359,12 +363,48 @@ func TextContent(text string) map[string]interface{} {
 	}
 }
 
-// Example helper to create error content
+// ErrorContent creates an error response with text content.
+//
+// Example:
+//
+//	if input < 0 {
+//	    return mcp.ErrorContent("Error: Input must be positive"), nil
+//	}
 func ErrorContent(text string) map[string]interface{} {
 	return map[string]interface{}{
 		"content": []map[string]interface{}{
 			{"type": "text", "text": text},
 		},
 		"isError": true,
+	}
+}
+
+// ImageContent creates a response with image content.
+// The data parameter should be a base64-encoded string.
+// Common MIME types: "image/png", "image/jpeg", "image/gif", "image/webp"
+//
+// Example:
+//
+//	imageData := base64.StdEncoding.EncodeToString(pngBytes)
+//	return mcp.ImageContent(imageData, "image/png"), nil
+func ImageContent(data string, mimeType string) map[string]interface{} {
+	return map[string]interface{}{
+		"content": []map[string]interface{}{
+			{"type": "image", "data": data, "mimeType": mimeType},
+		},
+	}
+}
+
+// MixedContent creates a response with multiple content blocks (text, images, etc).
+//
+// Example:
+//
+//	return MixedContent(
+//	    map[string]interface{}{"type": "text", "text": "Here's the chart:"},
+//	    map[string]interface{}{"type": "image", "data": base64Data, "mimeType": "image/png"},
+//	)
+func MixedContent(blocks ...map[string]interface{}) map[string]interface{} {
+	return map[string]interface{}{
+		"content": blocks,
 	}
 }

@@ -30,6 +30,12 @@ type Transport interface {
 	Close() error
 
 	// IsReady checks if the transport is ready for communication.
+	//
+	// Returns true after successful Connect() and before Close().
+	// Primarily used for testing transport state transitions.
+	//
+	// Note: Most applications don't need to call this directly - the SDK
+	// handles connection management automatically.
 	IsReady() bool
 
 	// EndInput signals the end of the input stream (close stdin for process transports).

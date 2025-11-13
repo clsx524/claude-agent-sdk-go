@@ -2,9 +2,7 @@ package claude
 
 import (
 	"context"
-	"fmt"
 	"os"
-
 )
 
 // Query performs a one-shot or unidirectional streaming query to Claude Code.
@@ -91,23 +89,10 @@ func processQuery(
 	}
 
 	// Validate and configure permission settings
-	configuredOptions := options
-	if options.CanUseTool != nil {
-		// Check if prompt is streaming
-		if _, isStreaming := prompt.(<-chan map[string]interface{}); !isStreaming {
-			return nil, nil, fmt.Errorf("can_use_tool callback requires streaming mode")
-		}
-
-		// canUseTool and permission_prompt_tool_name are mutually exclusive
-		if options.PermissionPromptToolName != nil {
-			return nil, nil, fmt.Errorf("can_use_tool callback cannot be used with permission_prompt_tool_name")
-		}
-
-		// Set permission_prompt_tool_name to "stdio" for control protocol
-		stdio := "stdio"
-		newOpts := *options
-		newOpts.PermissionPromptToolName = &stdio
-		configuredOptions = &newOpts
+	_, isStreaming := prompt.(<-chan map[string]interface{})
+	configuredOptions, err := validateAndConfigurePermissions(options, isStreaming)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	// Use provided transport or create subprocess transport
@@ -125,16 +110,14 @@ func processQuery(
 		return nil, nil, err
 	}
 
-	// Extract SDK MCP servers
-	sdkMcpServers := make(map[string]interface{})
-	for name, config := range configuredOptions.McpServers {
-		if sdkConfig, ok := config.(McpSdkServerConfig); ok {
-			sdkMcpServers[name] = sdkConfig.Instance
-		}
-	}
+	// Extract SDK MCP servers using helper function
+	sdkMcpServers := extractSdkMcpServers(configuredOptions.McpServers)
 
-	// Determine if streaming
-	_, isStreaming := prompt.(<-chan map[string]interface{})
+	// Determine buffer size
+	bufferSize := 100 // default
+	if configuredOptions.MessageChannelBufferSize != nil && *configuredOptions.MessageChannelBufferSize > 0 {
+		bufferSize = *configuredOptions.MessageChannelBufferSize
+	}
 
 	// Create queryHandler to handle control protocol
 	q := newQueryHandler(
@@ -143,6 +126,7 @@ func processQuery(
 		configuredOptions.CanUseTool,
 		configuredOptions.Hooks,
 		sdkMcpServers,
+		bufferSize,
 	)
 
 	// Start reading messages

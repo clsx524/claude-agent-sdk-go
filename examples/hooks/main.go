@@ -4,53 +4,91 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 
 	claude "github.com/clsx524/claude-agent-sdk-go"
 )
 
-func main() {
-	fmt.Println("=== Hooks Example ===")
-
-	// Example 1: PreToolUse hook to block dangerous commands
-	example1BlockDangerousCommands()
-
-	// Example 2: UserPromptSubmit hook to add context
-	fmt.Println("\n=== UserPromptSubmit Hook Example ===")
-	example2AddContext()
+func displayMessage(msg claude.Message) {
+	if assistantMsg, ok := msg.(*claude.AssistantMessage); ok {
+		for _, block := range assistantMsg.Content {
+			if textBlock, ok := block.(claude.TextBlock); ok {
+				fmt.Printf("Claude: %s\n", textBlock.Text)
+			}
+		}
+	} else if _, ok := msg.(*claude.ResultMessage); ok {
+		fmt.Println("Result ended")
+	}
 }
 
-func example1BlockDangerousCommands() {
+func main() {
+	if len(os.Args) < 2 {
+		fmt.Println("Usage: go run main.go <example_name>")
+		fmt.Println("\nAvailable examples:")
+		fmt.Println("  all              - Run all examples")
+		fmt.Println("  PreToolUse       - Block commands using PreToolUse hook")
+		fmt.Println("  UserPromptSubmit - Add context at prompt submission")
+		fmt.Println("  PostToolUse      - Review tool output with reason and systemMessage")
+		fmt.Println("  DecisionFields   - Use permissionDecision='allow'/'deny' with reason")
+		fmt.Println("  ContinueControl  - Control execution with continue and stopReason")
+		os.Exit(0)
+	}
+
+	exampleName := os.Args[1]
+
+	examples := map[string]func(){
+		"PreToolUse":       examplePreToolUse,
+		"UserPromptSubmit": exampleUserPromptSubmit,
+		"PostToolUse":      examplePostToolUse,
+		"DecisionFields":   exampleDecisionFields,
+		"ContinueControl":  exampleContinueControl,
+	}
+
+	if exampleName == "all" {
+		for name, fn := range examples {
+			fmt.Printf("\n=== Running %s ===\n", name)
+			fn()
+			fmt.Println(strings.Repeat("-", 50))
+		}
+	} else if fn, ok := examples[exampleName]; ok {
+		fn()
+	} else {
+		fmt.Printf("Error: Unknown example '%s'\n", exampleName)
+		fmt.Println("\nAvailable examples:")
+		fmt.Println("  all - Run all examples")
+		for name := range examples {
+			fmt.Printf("  %s\n", name)
+		}
+		os.Exit(1)
+	}
+}
+
+// Example 1: PreToolUse hook to block dangerous commands
+func examplePreToolUse() {
+	fmt.Println("=== PreToolUse Example ===")
+	fmt.Println("This example demonstrates how PreToolUse can block some bash commands but not others.")
+
 	// Create a hook that blocks certain bash commands
-	bashHook := func(ctx context.Context, input map[string]interface{}, toolUseID *string, hookCtx claude.HookContext) (claude.HookJSONOutput, error) {
+	checkBashCommand := func(ctx context.Context, input map[string]interface{}, toolUseID *string, hookCtx claude.HookContext) (claude.HookJSONOutput, error) {
 		toolName, _ := input["tool_name"].(string)
 		toolInput, _ := input["tool_input"].(map[string]interface{})
 
-		// Only process Bash tool
 		if toolName != "Bash" {
 			return claude.HookJSONOutput{}, nil
 		}
 
 		command, _ := toolInput["command"].(string)
-
-		// Block patterns
-		blockPatterns := []string{
-			"rm -rf",
-			"sudo",
-			"foo.sh", // From Python SDK example
-		}
+		blockPatterns := []string{"foo.sh"}
 
 		for _, pattern := range blockPatterns {
 			if strings.Contains(command, pattern) {
-				decision := "block"
-				reason := fmt.Sprintf("Command contains forbidden pattern: %s", pattern)
-
+				log.Printf("Blocked command: %s", command)
 				return claude.HookJSONOutput{
-					Decision: &decision,
 					HookSpecificOutput: map[string]interface{}{
 						"hookEventName":            "PreToolUse",
 						"permissionDecision":       "deny",
-						"permissionDecisionReason": reason,
+						"permissionDecisionReason": fmt.Sprintf("Command contains invalid pattern: %s", pattern),
 					},
 				}, nil
 			}
@@ -63,10 +101,7 @@ func example1BlockDangerousCommands() {
 		AllowedTools: []string{"Bash"},
 		Hooks: map[claude.HookEvent][]claude.HookMatcher{
 			claude.HookEventPreToolUse: {
-				{
-					Matcher: "Bash",
-					Hooks:   []claude.HookCallback{bashHook},
-				},
+				{Matcher: "Bash", Hooks: []claude.HookCallback{checkBashCommand}},
 			},
 		},
 	}
@@ -74,66 +109,56 @@ func example1BlockDangerousCommands() {
 	ctx := context.Background()
 	client := claude.NewClaudeSDKClient(options)
 
-	if err := client.Connect(ctx, nil); err != nil {
+	if err := client.Connect(ctx); err != nil {
 		log.Fatalf("Failed to connect: %v", err)
 	}
 	defer client.Disconnect()
 
-	// Test 1: Blocked command
-	fmt.Println("Test 1: Trying to run blocked command (foo.sh)")
-	if err := client.Query(ctx, "Run the bash command: ./foo.sh --help", "default"); err != nil {
-		log.Printf("Failed to send query: %v", err)
-	} else {
-		for msg := range client.ReceiveResponse(ctx) {
-			if assistantMsg, ok := msg.(*claude.AssistantMessage); ok {
-				for _, block := range assistantMsg.Content {
-					if textBlock, ok := block.(claude.TextBlock); ok {
-						fmt.Printf("Claude: %s\n", textBlock.Text)
-					}
-				}
-			}
-		}
+	// Test 1: Command with forbidden pattern (will be blocked)
+	fmt.Println("Test 1: Trying a command that our PreToolUse hook should block...")
+	fmt.Println("User: Run the bash command: ./foo.sh --help")
+	msgCh, errCh := client.Query(ctx, "Run the bash command: ./foo.sh --help")
+	for msg := range msgCh {
+		displayMessage(msg)
+	}
+	if err := <-errCh; err != nil {
+		log.Printf("Error: %v", err)
 	}
 
-	// Test 2: Allowed command
-	fmt.Println("\nTest 2: Trying to run allowed command")
-	if err := client.Query(ctx, "Run the bash command: echo 'Hello from hooks example!'", "default"); err != nil {
-		log.Printf("Failed to send query: %v", err)
-	} else {
-		for msg := range client.ReceiveResponse(ctx) {
-			if assistantMsg, ok := msg.(*claude.AssistantMessage); ok {
-				for _, block := range assistantMsg.Content {
-					if textBlock, ok := block.(claude.TextBlock); ok {
-						fmt.Printf("Claude: %s\n", textBlock.Text)
-					}
-				}
-			}
-		}
+	fmt.Println("\n" + strings.Repeat("=", 50) + "\n")
+
+	// Test 2: Safe command that should work
+	fmt.Println("Test 2: Trying a command that our PreToolUse hook should allow...")
+	fmt.Println("User: Run the bash command: echo 'Hello from hooks example!'")
+	msgCh2, errCh2 := client.Query(ctx, "Run the bash command: echo 'Hello from hooks example!'")
+	for msg := range msgCh2 {
+		displayMessage(msg)
 	}
+	if err := <-errCh2; err != nil {
+		log.Printf("Error: %v", err)
+	}
+
+	fmt.Println()
 }
 
-func example2AddContext() {
-	// Create a hook that adds additional context to user prompts
-	userPromptHook := func(ctx context.Context, input map[string]interface{}, toolUseID *string, hookCtx claude.HookContext) (claude.HookJSONOutput, error) {
-		// Add timestamp and additional context
-		additionalContext := "Current time: 2025-10-02. You are running in a Go SDK example."
+// Example 2: UserPromptSubmit hook to add context
+func exampleUserPromptSubmit() {
+	fmt.Println("=== UserPromptSubmit Example ===")
+	fmt.Println("This example shows how a UserPromptSubmit hook can add context.")
 
+	addCustomInstructions := func(ctx context.Context, input map[string]interface{}, toolUseID *string, hookCtx claude.HookContext) (claude.HookJSONOutput, error) {
 		return claude.HookJSONOutput{
 			HookSpecificOutput: map[string]interface{}{
-				"additionalContext": additionalContext,
+				"hookEventName":     "SessionStart",
+				"additionalContext": "My favorite color is hot pink",
 			},
 		}, nil
 	}
 
-	maxTurns := 1
 	options := &claude.ClaudeAgentOptions{
-		MaxTurns: &maxTurns,
 		Hooks: map[claude.HookEvent][]claude.HookMatcher{
 			claude.HookEventUserPromptSubmit: {
-				{
-					Matcher: "", // Empty matcher matches all
-					Hooks:   []claude.HookCallback{userPromptHook},
-				},
+				{Matcher: "", Hooks: []claude.HookCallback{addCustomInstructions}},
 			},
 		},
 	}
@@ -141,87 +166,218 @@ func example2AddContext() {
 	ctx := context.Background()
 	client := claude.NewClaudeSDKClient(options)
 
-	if err := client.Connect(ctx, nil); err != nil {
+	if err := client.Connect(ctx); err != nil {
 		log.Fatalf("Failed to connect: %v", err)
 	}
 	defer client.Disconnect()
 
-	if err := client.Query(ctx, "What time is it?", "default"); err != nil {
-		log.Printf("Failed to send query: %v", err)
-		return
+	fmt.Println("User: What's my favorite color?")
+	msgCh, errCh := client.Query(ctx, "What's my favorite color?")
+	for msg := range msgCh {
+		displayMessage(msg)
+	}
+	if err := <-errCh; err != nil {
+		log.Printf("Error: %v", err)
 	}
 
-	for msg := range client.ReceiveResponse(ctx) {
-		if assistantMsg, ok := msg.(*claude.AssistantMessage); ok {
-			for _, block := range assistantMsg.Content {
-				if textBlock, ok := block.(claude.TextBlock); ok {
-					fmt.Printf("Claude: %s\n", textBlock.Text)
-				}
-			}
-		}
-	}
+	fmt.Println()
 }
 
-func examplePermissionCallback() {
-	// Example with canUseTool callback
-	canUseTool := func(ctx context.Context, toolName string, input map[string]interface{}, permCtx claude.ToolPermissionContext) (claude.PermissionResult, error) {
-		fmt.Printf("Permission request for tool: %s\n", toolName)
-		fmt.Printf("Input: %v\n", input)
+// Example 3: PostToolUse hook to review tool output
+func examplePostToolUse() {
+	fmt.Println("=== PostToolUse Example ===")
+	fmt.Println("This example shows how PostToolUse can provide feedback with reason and systemMessage.")
 
-		// Allow read-only operations
-		readOnlyTools := []string{"Read", "Glob", "Grep"}
-		for _, tool := range readOnlyTools {
-			if tool == toolName {
-				return claude.PermissionResultAllow{
-					Behavior: "allow",
-				}, nil
-			}
+	reviewToolOutput := func(ctx context.Context, input map[string]interface{}, toolUseID *string, hookCtx claude.HookContext) (claude.HookJSONOutput, error) {
+		toolResponse, _ := input["tool_response"]
+
+		// If the tool produced an error, add helpful context
+		if strings.Contains(strings.ToLower(fmt.Sprint(toolResponse)), "error") {
+			reason := "Tool execution failed - consider checking the command syntax"
+			systemMessage := "⚠️ The command produced an error"
+
+			return claude.HookJSONOutput{
+				SystemMessage: &systemMessage,
+				Reason:        &reason,
+				HookSpecificOutput: map[string]interface{}{
+					"hookEventName":     "PostToolUse",
+					"additionalContext": "The command encountered an error. You may want to try a different approach.",
+				},
+			}, nil
 		}
 
-		// Block dangerous operations
-		if toolName == "Bash" {
-			command, _ := input["command"].(string)
-			if strings.Contains(command, "rm") {
-				return claude.PermissionResultDeny{
-					Behavior: "deny",
-					Message:  "Destructive commands are not allowed",
-				}, nil
-			}
-		}
-
-		// Allow everything else
-		return claude.PermissionResultAllow{
-			Behavior: "allow",
-		}, nil
+		return claude.HookJSONOutput{}, nil
 	}
 
 	options := &claude.ClaudeAgentOptions{
-		CanUseTool:   canUseTool,
-		AllowedTools: []string{"Read", "Write", "Bash"},
+		AllowedTools: []string{"Bash"},
+		Hooks: map[claude.HookEvent][]claude.HookMatcher{
+			claude.HookEventPostToolUse: {
+				{Matcher: "Bash", Hooks: []claude.HookCallback{reviewToolOutput}},
+			},
+		},
 	}
 
 	ctx := context.Background()
 	client := claude.NewClaudeSDKClient(options)
 
-	if err := client.Connect(ctx, nil); err != nil {
+	if err := client.Connect(ctx); err != nil {
 		log.Fatalf("Failed to connect: %v", err)
 	}
 	defer client.Disconnect()
 
-	fmt.Println("\n=== Permission Callback Example ===")
-
-	if err := client.Query(ctx, "List the files in the current directory", "default"); err != nil {
-		log.Printf("Failed to send query: %v", err)
-		return
+	fmt.Println("User: Run a command that will produce an error: ls /nonexistent_directory")
+	msgCh, errCh := client.Query(ctx, "Run this command: ls /nonexistent_directory")
+	for msg := range msgCh {
+		displayMessage(msg)
+	}
+	if err := <-errCh; err != nil {
+		log.Printf("Error: %v", err)
 	}
 
-	for msg := range client.ReceiveResponse(ctx) {
-		if assistantMsg, ok := msg.(*claude.AssistantMessage); ok {
-			for _, block := range assistantMsg.Content {
-				if textBlock, ok := block.(claude.TextBlock); ok {
-					fmt.Printf("Claude: %s\n", textBlock.Text)
-				}
+	fmt.Println()
+}
+
+// Example 4: Using permissionDecision with reason and systemMessage
+func exampleDecisionFields() {
+	fmt.Println("=== Permission Decision Example ===")
+	fmt.Println("This example shows how to use permissionDecision='allow'/'deny' with reason and systemMessage.")
+
+	strictApprovalHook := func(ctx context.Context, input map[string]interface{}, toolUseID *string, hookCtx claude.HookContext) (claude.HookJSONOutput, error) {
+		toolName, _ := input["tool_name"].(string)
+		toolInput, _ := input["tool_input"].(map[string]interface{})
+
+		// Block any Write operations to specific files
+		if toolName == "Write" {
+			filePath, _ := toolInput["file_path"].(string)
+			if strings.Contains(strings.ToLower(filePath), "important") {
+				log.Printf("Blocked Write to: %s", filePath)
+				reason := "Writes to files containing 'important' in the name are not allowed for safety"
+				systemMessage := "🚫 Write operation blocked by security policy"
+
+				return claude.HookJSONOutput{
+					Reason:        &reason,
+					SystemMessage: &systemMessage,
+					HookSpecificOutput: map[string]interface{}{
+						"hookEventName":            "PreToolUse",
+						"permissionDecision":       "deny",
+						"permissionDecisionReason": "Security policy blocks writes to important files",
+					},
+				}, nil
 			}
 		}
+
+		// Allow everything else explicitly
+		reason := "Tool use approved after security review"
+		return claude.HookJSONOutput{
+			Reason: &reason,
+			HookSpecificOutput: map[string]interface{}{
+				"hookEventName":            "PreToolUse",
+				"permissionDecision":       "allow",
+				"permissionDecisionReason": "Tool passed security checks",
+			},
+		}, nil
 	}
+
+	model := "claude-sonnet-4-5-20250929"
+	options := &claude.ClaudeAgentOptions{
+		AllowedTools: []string{"Write", "Bash"},
+		Model:        &model,
+		Hooks: map[claude.HookEvent][]claude.HookMatcher{
+			claude.HookEventPreToolUse: {
+				{Matcher: "Write", Hooks: []claude.HookCallback{strictApprovalHook}},
+			},
+		},
+	}
+
+	ctx := context.Background()
+	client := claude.NewClaudeSDKClient(options)
+
+	if err := client.Connect(ctx); err != nil {
+		log.Fatalf("Failed to connect: %v", err)
+	}
+	defer client.Disconnect()
+
+	// Test 1: Try to write to a file with "important" in the name (should be blocked)
+	fmt.Println("Test 1: Trying to write to important_config.txt (should be blocked)...")
+	fmt.Println("User: Write 'test' to important_config.txt")
+	msgCh, errCh := client.Query(ctx, "Write the text 'test data' to a file called important_config.txt")
+	for msg := range msgCh {
+		displayMessage(msg)
+	}
+	if err := <-errCh; err != nil {
+		log.Printf("Error: %v", err)
+	}
+
+	fmt.Println("\n" + strings.Repeat("=", 50) + "\n")
+
+	// Test 2: Write to a regular file (should be approved)
+	fmt.Println("Test 2: Trying to write to regular_file.txt (should be approved)...")
+	fmt.Println("User: Write 'test' to regular_file.txt")
+	msgCh2, errCh2 := client.Query(ctx, "Write the text 'test data' to a file called regular_file.txt")
+	for msg := range msgCh2 {
+		displayMessage(msg)
+	}
+	if err := <-errCh2; err != nil {
+		log.Printf("Error: %v", err)
+	}
+
+	fmt.Println()
+}
+
+// Example 5: Using continue and stopReason for execution control
+func exampleContinueControl() {
+	fmt.Println("=== Continue/Stop Control Example ===")
+	fmt.Println("This example shows how to use Continue=false with StopReason to halt execution.")
+
+	stopOnErrorHook := func(ctx context.Context, input map[string]interface{}, toolUseID *string, hookCtx claude.HookContext) (claude.HookJSONOutput, error) {
+		toolResponse, _ := input["tool_response"]
+
+		// Stop execution if we see a critical error
+		if strings.Contains(strings.ToLower(fmt.Sprint(toolResponse)), "critical") {
+			log.Println("Critical error detected - stopping execution")
+			continueExec := false
+			stopReason := "Critical error detected in tool output - execution halted for safety"
+			systemMessage := "🛑 Execution stopped due to critical error"
+
+			return claude.HookJSONOutput{
+				Continue:      &continueExec,
+				StopReason:    &stopReason,
+				SystemMessage: &systemMessage,
+			}, nil
+		}
+
+		continueExec := true
+		return claude.HookJSONOutput{
+			Continue: &continueExec,
+		}, nil
+	}
+
+	options := &claude.ClaudeAgentOptions{
+		AllowedTools: []string{"Bash"},
+		Hooks: map[claude.HookEvent][]claude.HookMatcher{
+			claude.HookEventPostToolUse: {
+				{Matcher: "Bash", Hooks: []claude.HookCallback{stopOnErrorHook}},
+			},
+		},
+	}
+
+	ctx := context.Background()
+	client := claude.NewClaudeSDKClient(options)
+
+	if err := client.Connect(ctx); err != nil {
+		log.Fatalf("Failed to connect: %v", err)
+	}
+	defer client.Disconnect()
+
+	fmt.Println("User: Run a command that outputs 'CRITICAL ERROR'")
+	msgCh, errCh := client.Query(ctx, "Run this bash command: echo 'CRITICAL ERROR: system failure'")
+	for msg := range msgCh {
+		displayMessage(msg)
+	}
+	if err := <-errCh; err != nil {
+		log.Printf("Error: %v", err)
+	}
+
+	fmt.Println()
 }

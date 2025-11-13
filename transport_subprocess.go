@@ -9,14 +9,19 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
-
+	"time"
 )
 
 const (
-	defaultMaxBufferSize = 1024 * 1024 // 1MB
-	sdkVersion           = "0.1.0"
+	defaultMaxBufferSize     = 1024 * 1024 // 1MB
+	sdkVersion               = "0.1.0"
+	minimumClaudeCodeVersion = "2.0.0"
+	windowsCmdLengthLimit    = 8000   // Windows command line length limit
+	nonWindowsCmdLengthLimit = 100000 // Non-Windows systems have much higher limits
 )
 
 // SubprocessCLITransport implements Transport using Claude Code CLI subprocess.
@@ -33,6 +38,7 @@ type SubprocessCLITransport struct {
 	ready         bool
 	exitError     error
 	maxBufferSize int
+	tempFiles     []string // Temporary files created for long command lines
 	mu            sync.RWMutex
 	stderrWg      sync.WaitGroup
 }
@@ -92,6 +98,7 @@ func findCLI() (string, error) {
 		filepath.Join(homeDir, ".local", "bin", "claude"),
 		filepath.Join(homeDir, "node_modules", ".bin", "claude"),
 		filepath.Join(homeDir, ".yarn", "bin", "claude"),
+		filepath.Join(homeDir, ".claude", "local", "claude"), // Local Claude installation
 	}
 
 	for _, loc := range locations {
@@ -117,6 +124,11 @@ func (t *SubprocessCLITransport) Connect(ctx context.Context) error {
 
 	if t.cmd != nil {
 		return nil // Already connected
+	}
+
+	// Check Claude Code version
+	if err := t.checkClaudeVersion(ctx); err != nil {
+		return err
 	}
 
 	// Build command
@@ -214,6 +226,17 @@ func (t *SubprocessCLITransport) buildCommand() []string {
 	if t.options.Model != nil {
 		args = append(args, "--model", *t.options.Model)
 	}
+	if t.options.FallbackModel != nil {
+		args = append(args, "--fallback-model", *t.options.FallbackModel)
+	}
+
+	// Budget and token control
+	if t.options.MaxBudgetUSD != nil {
+		args = append(args, "--max-budget-usd", fmt.Sprintf("%.2f", *t.options.MaxBudgetUSD))
+	}
+	if t.options.MaxThinkingTokens != nil {
+		args = append(args, "--max-thinking-tokens", fmt.Sprintf("%d", *t.options.MaxThinkingTokens))
+	}
 
 	// Permission settings
 	if t.options.PermissionMode != nil {
@@ -286,6 +309,16 @@ func (t *SubprocessCLITransport) buildCommand() []string {
 		args = append(args, "--setting-sources", "")
 	}
 
+	// Plugins
+	if len(t.options.Plugins) > 0 {
+		for _, plugin := range t.options.Plugins {
+			if plugin.Type == "local" {
+				args = append(args, "--plugin-dir", plugin.Path)
+			}
+			// Note: Other plugin types can be added in the future
+		}
+	}
+
 	// Extra args
 	for flag, value := range t.options.ExtraArgs {
 		if value == nil {
@@ -303,7 +336,57 @@ func (t *SubprocessCLITransport) buildCommand() []string {
 		args = append(args, "--print", "--", t.prompt.(string))
 	}
 
+	// Check if command line is too long (Windows limitation)
+	// This optimization helps when large agent definitions would exceed command line limits
+	cmdStr := strings.Join(args, " ")
+	cmdLengthLimit := nonWindowsCmdLengthLimit
+	if isWindows() {
+		cmdLengthLimit = windowsCmdLengthLimit
+	}
+
+	if len(cmdStr) > cmdLengthLimit && len(t.options.Agents) > 0 {
+		// Command is too long - use temp file for agents
+		// Find the --agents argument and replace its value with @filepath
+		for i, arg := range args {
+			if arg == "--agents" && i+1 < len(args) {
+				agentsJSONValue := args[i+1]
+
+				// Create a temporary file
+				tempFile, err := os.CreateTemp("", "claude-agents-*.json")
+				if err != nil {
+					// Log warning but continue - the command might still work
+					fmt.Fprintf(os.Stderr, "Warning: Failed to create temp file for long command: %v\n", err)
+					break
+				}
+
+				// Write the agents JSON to the file
+				if _, err := tempFile.WriteString(agentsJSONValue); err != nil {
+					tempFile.Close()
+					os.Remove(tempFile.Name())
+					fmt.Fprintf(os.Stderr, "Warning: Failed to write to temp file: %v\n", err)
+					break
+				}
+				tempFile.Close()
+
+				// Track for cleanup
+				t.tempFiles = append(t.tempFiles, tempFile.Name())
+
+				// Replace agents JSON with @filepath reference
+				args[i+1] = "@" + tempFile.Name()
+
+				fmt.Fprintf(os.Stderr, "Command line length (%d) exceeds limit (%d). Using temp file for --agents: %s\n",
+					len(cmdStr), cmdLengthLimit, tempFile.Name())
+				break
+			}
+		}
+	}
+
 	return args
+}
+
+// isWindows returns true if running on Windows
+func isWindows() bool {
+	return os.PathSeparator == '\\' && os.PathListSeparator == ';'
 }
 
 // buildEnv constructs environment variables.
@@ -381,11 +464,15 @@ func (t *SubprocessCLITransport) ReadMessages(ctx context.Context) (<-chan map[s
 		defer close(errCh)
 
 		scanner := bufio.NewScanner(t.stdout)
-		// Set large buffer size for scanner
-		buf := make([]byte, 0, 64*1024)
+		// Set initial buffer size for scanner (configurable, default 64KB)
+		initialSize := 64 * 1024
+		if t.options != nil && t.options.ScannerInitialBufferSize != nil && *t.options.ScannerInitialBufferSize > 0 {
+			initialSize = *t.options.ScannerInitialBufferSize
+		}
+		buf := make([]byte, 0, initialSize)
 		scanner.Buffer(buf, t.maxBufferSize)
 
-		jsonBuffer := ""
+		var jsonBuffer strings.Builder
 
 		for scanner.Scan() {
 			select {
@@ -409,22 +496,22 @@ func (t *SubprocessCLITransport) ReadMessages(ctx context.Context) (<-chan map[s
 					continue
 				}
 
-				// Accumulate partial JSON
-				jsonBuffer += jsonLine
+				// Accumulate partial JSON using strings.Builder for efficiency
+				jsonBuffer.WriteString(jsonLine)
 
-				if len(jsonBuffer) > t.maxBufferSize {
+				if jsonBuffer.Len() > t.maxBufferSize {
 					errCh <- NewCLIJSONDecodeError(
 						fmt.Sprintf("JSON message exceeded maximum buffer size of %d bytes", t.maxBufferSize),
-						fmt.Errorf("buffer size %d exceeds limit %d", len(jsonBuffer), t.maxBufferSize),
+						fmt.Errorf("buffer size %d exceeds limit %d", jsonBuffer.Len(), t.maxBufferSize),
 					)
 					return
 				}
 
 				// Try to parse
 				var data map[string]interface{}
-				if err := json.Unmarshal([]byte(jsonBuffer), &data); err == nil {
+				if err := json.Unmarshal([]byte(jsonBuffer.String()), &data); err == nil {
 					// Successfully parsed
-					jsonBuffer = ""
+					jsonBuffer.Reset()
 					msgCh <- data
 				}
 				// If parse fails, keep accumulating
@@ -465,7 +552,10 @@ func (t *SubprocessCLITransport) EndInput() error {
 	return nil
 }
 
-// IsReady checks if transport is ready.
+// IsReady checks if transport is ready for communication.
+//
+// Returns true after successful Connect() and before Close().
+// Thread-safe for concurrent access.
 func (t *SubprocessCLITransport) IsReady() bool {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -483,23 +573,129 @@ func (t *SubprocessCLITransport) Close() error {
 		return nil
 	}
 
-	// Close stdin
+	// Close stdin to signal the process
 	if t.stdin != nil {
 		t.stdin.Close()
 		t.stdin = nil
 	}
 
-	// Wait for stderr reader
-	t.stderrWg.Wait()
-
 	// Kill process if still running
 	if t.cmd.Process != nil && t.cmd.ProcessState == nil {
 		t.cmd.Process.Kill()
-		t.cmd.Wait()
 	}
+
+	// Wait for process with timeout to avoid hanging
+	if t.cmd != nil && t.cmd.Process != nil {
+		done := make(chan struct{})
+		go func() {
+			t.cmd.Wait()
+			close(done)
+		}()
+
+		// Wait up to 2 seconds for process to exit
+		select {
+		case <-done:
+			// Process exited normally
+		case <-time.After(2 * time.Second):
+			// Force kill if still running
+			if t.cmd.Process != nil {
+				t.cmd.Process.Signal(os.Kill)
+			}
+		}
+	}
+
+	// Wait for stderr reader to finish (with timeout)
+	stderrDone := make(chan struct{})
+	go func() {
+		t.stderrWg.Wait()
+		close(stderrDone)
+	}()
+	select {
+	case <-stderrDone:
+	case <-time.After(1 * time.Second):
+		// Stderr reader didn't finish, continue anyway
+	}
+
+	// Clean up temporary files
+	for _, tempFile := range t.tempFiles {
+		if err := os.Remove(tempFile); err != nil {
+			// Log but don't fail on cleanup errors
+			fmt.Fprintf(os.Stderr, "Warning: Failed to remove temp file %s: %v\n", tempFile, err)
+		}
+	}
+	t.tempFiles = nil
 
 	t.cmd = nil
 	t.exitError = nil
 
 	return nil
+}
+
+// checkClaudeVersion checks if the Claude Code CLI version meets minimum requirements.
+// Returns an error if the version check fails critically, or logs a warning for outdated versions.
+func (t *SubprocessCLITransport) checkClaudeVersion(ctx context.Context) error {
+	// Skip version check if environment variable is set
+	if os.Getenv("CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK") != "" {
+		return nil
+	}
+
+	// Create context with timeout
+	checkCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	// Run claude -v to get version
+	cmd := exec.CommandContext(checkCtx, t.cliPath, "-v")
+	output, err := cmd.Output()
+	if err != nil {
+		// If version check fails, log but don't block (CLI might still work)
+		return nil
+	}
+
+	// Parse version from output
+	versionStr := strings.TrimSpace(string(output))
+	re := regexp.MustCompile(`([0-9]+\.[0-9]+\.[0-9]+)`)
+	match := re.FindStringSubmatch(versionStr)
+
+	if match == nil {
+		// Couldn't parse version, skip check
+		return nil
+	}
+
+	version := match[1]
+
+	// Compare versions
+	if compareVersions(version, minimumClaudeCodeVersion) < 0 {
+		warning := fmt.Sprintf("Warning: Claude Code version %s is unsupported in the Agent SDK. "+
+			"Minimum required version is %s. "+
+			"Some features may not work correctly.", version, minimumClaudeCodeVersion)
+		fmt.Fprintln(os.Stderr, warning)
+	}
+
+	return nil
+}
+
+// compareVersions compares two semantic version strings.
+// Returns: -1 if v1 < v2, 0 if v1 == v2, 1 if v1 > v2
+func compareVersions(v1, v2 string) int {
+	parts1 := strings.Split(v1, ".")
+	parts2 := strings.Split(v2, ".")
+
+	for i := 0; i < 3; i++ {
+		var num1, num2 int
+		if i < len(parts1) {
+			num1, _ = strconv.Atoi(parts1[i])
+		}
+		if i < len(parts2) {
+			num2, _ = strconv.Atoi(parts2[i])
+		}
+
+		if num1 < num2 {
+			return -1
+		}
+		if num1 > num2 {
+			return 1
+		}
+	}
+
+	return 0
 }

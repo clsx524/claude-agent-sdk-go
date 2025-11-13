@@ -79,6 +79,14 @@ type ToolResultBlock struct {
 
 func (ToolResultBlock) isContentBlock() {}
 
+// ImageBlock represents image content with base64 data.
+type ImageBlock struct {
+	Data     string `json:"data"`
+	MimeType string `json:"mimeType"`
+}
+
+func (ImageBlock) isContentBlock() {}
+
 // UserMessage represents a user message.
 type UserMessage struct {
 	Content         interface{} `json:"content"` // Can be string or []ContentBlock
@@ -192,8 +200,8 @@ type PermissionResult interface {
 // PermissionResultAllow indicates the tool is allowed.
 type PermissionResultAllow struct {
 	Behavior           string                 `json:"behavior"` // Always "allow"
-	UpdatedInput       map[string]interface{} `json:"updated_input,omitempty"`
-	UpdatedPermissions []PermissionUpdate     `json:"updated_permissions,omitempty"`
+	UpdatedInput       map[string]interface{} `json:"updatedInput,omitempty"`
+	UpdatedPermissions []PermissionUpdate     `json:"updatedPermissions,omitempty"`
 }
 
 func (PermissionResultAllow) isPermissionResult() {}
@@ -207,13 +215,134 @@ type PermissionResultDeny struct {
 
 func (PermissionResultDeny) isPermissionResult() {}
 
+// PermissionResultAsk indicates the tool requires user confirmation.
+//
+// This result prompts the user to approve, deny, or modify the tool use.
+// You can optionally modify the tool's input parameters or update permission
+// settings for future tool uses.
+//
+// Fields:
+//   - Behavior: Must be "ask"
+//   - Message: Optional message shown to the user when asking for permission
+//   - UpdatedInput: Optional modified input parameters for the tool
+//   - UpdatedPermissions: Optional permission updates to apply if user approves
+//
+// Example - Ask for confirmation on destructive commands:
+//
+//	if toolName == "Bash" {
+//	    command := input["command"].(string)
+//	    if strings.Contains(command, "rm") {
+//	        return PermissionResultAsk{
+//	            Behavior: "ask",
+//	            Message: fmt.Sprintf("Allow deletion command: %s?", command),
+//	        }, nil
+//	    }
+//	}
+//
+// Example - Ask with modified input:
+//
+//	if toolName == "Write" {
+//	    filePath := input["file_path"].(string)
+//	    if strings.HasPrefix(filePath, "/etc/") {
+//	        return PermissionResultAsk{
+//	            Behavior: "ask",
+//	            Message: "Write to system directory - proceed with caution?",
+//	            UpdatedInput: map[string]interface{}{
+//	                "file_path": filePath,
+//	                "backup": true, // Suggest creating a backup
+//	            },
+//	        }, nil
+//	    }
+//	}
+//
+// Example - Ask and update future permissions:
+//
+//	return PermissionResultAsk{
+//	    Behavior: "ask",
+//	    Message: "Allow network access to external API?",
+//	    UpdatedPermissions: []PermissionUpdate{
+//	        {
+//	            ToolName: "WebFetch",
+//	            Permission: "allow",
+//	        },
+//	    },
+//	}, nil
+type PermissionResultAsk struct {
+	Behavior           string                 `json:"behavior"` // Always "ask"
+	Message            string                 `json:"message,omitempty"`
+	UpdatedInput       map[string]interface{} `json:"updatedInput,omitempty"`
+	UpdatedPermissions []PermissionUpdate     `json:"updatedPermissions,omitempty"`
+}
+
+func (PermissionResultAsk) isPermissionResult() {}
+
 // CanUseTool is the function type for tool permission callbacks.
+//
+// This callback is invoked before each tool use, allowing you to programmatically
+// control which tools Claude can use and modify their inputs.
+//
+// Example - Allow only read-only tools:
+//
+//	canUseTool := func(ctx context.Context, toolName string, input map[string]interface{}, permCtx ToolPermissionContext) (PermissionResult, error) {
+//	    readOnlyTools := map[string]bool{"Read": true, "Grep": true, "Glob": true}
+//	    if readOnlyTools[toolName] {
+//	        return PermissionResultAllow{Behavior: "allow"}, nil
+//	    }
+//	    return PermissionResultDeny{
+//	        Behavior: "deny",
+//	        Message:  "Only read-only operations allowed",
+//	    }, nil
+//	}
+//
+// Example - Block dangerous commands:
+//
+//	canUseTool := func(ctx context.Context, toolName string, input map[string]interface{}, permCtx ToolPermissionContext) (PermissionResult, error) {
+//	    if toolName == "Bash" {
+//	        command := input["command"].(string)
+//	        if strings.Contains(command, "rm -rf") {
+//	            return PermissionResultDeny{
+//	                Behavior: "deny",
+//	                Message:  "Dangerous command blocked",
+//	            }, nil
+//	        }
+//	    }
+//	    return PermissionResultAllow{Behavior: "allow"}, nil
+//	}
 type CanUseTool func(ctx context.Context, toolName string, input map[string]interface{}, permCtx ToolPermissionContext) (PermissionResult, error)
 
 // HookJSONOutput represents the output from a hook callback.
+// HookJSONOutput defines the structure for hook callbacks to control execution
+// and provide feedback to Claude.
+//
+// Common Control Fields:
+//   - Continue: Whether Claude should proceed after hook execution (default: true)
+//   - SuppressOutput: Hide stdout from transcript mode (default: false)
+//   - StopReason: Message shown when Continue is false
+//
+// Decision Fields:
+//   - Decision: Set to "block" to indicate blocking behavior
+//   - SystemMessage: Warning message displayed to the user
+//   - Reason: Feedback message for Claude about the decision
+//
+// Hook-Specific Output:
+//   - HookSpecificOutput: Event-specific controls (e.g., permissionDecision for
+//     PreToolUse, additionalContext for PostToolUse)
 type HookJSONOutput struct {
-	Decision           *string                `json:"decision,omitempty"` // "block"
-	SystemMessage      *string                `json:"systemMessage,omitempty"`
+	// Common control fields
+	Continue       *bool   `json:"continue,omitempty"`
+	SuppressOutput *bool   `json:"suppressOutput,omitempty"`
+	StopReason     *string `json:"stopReason,omitempty"`
+
+	// Async control fields (for deferring hook execution)
+	Async        *bool `json:"async,omitempty"`        // Set to true to defer hook execution
+	AsyncTimeout *int  `json:"asyncTimeout,omitempty"` // Timeout in milliseconds for async operation
+
+	// Decision fields
+	Decision      *string `json:"decision,omitempty"` // "block"
+	SystemMessage *string `json:"systemMessage,omitempty"`
+	Reason        *string `json:"reason,omitempty"`
+
+	// Hook-specific outputs
 	HookSpecificOutput map[string]interface{} `json:"hookSpecificOutput,omitempty"`
 }
 
@@ -223,7 +352,108 @@ type HookContext struct {
 }
 
 // HookCallback is the function type for hook callbacks.
+//
+// Hooks allow you to intercept and control Claude's execution at specific points.
+// They can modify behavior, block operations, or inject additional context.
+//
+// Example - PreToolUse hook to log all tool calls:
+//
+//	logToolUse := func(ctx context.Context, input map[string]interface{}, toolUseID *string, hookCtx HookContext) (HookJSONOutput, error) {
+//	    toolName := input["tool_name"].(string)
+//	    toolInput := input["tool_input"].(map[string]interface{})
+//	    log.Printf("Tool called: %s with input: %v", toolName, toolInput)
+//	    return HookJSONOutput{}, nil // Continue normally
+//	}
+//
+//	options := &ClaudeAgentOptions{
+//	    Hooks: map[HookEvent][]HookMatcher{
+//	        HookEventPreToolUse: {{Matcher: "*", Hooks: []HookCallback{logToolUse}}},
+//	    },
+//	}
+//
+// Example - Block specific tool uses:
+//
+//	blockDangerousTools := func(ctx context.Context, input map[string]interface{}, toolUseID *string, hookCtx HookContext) (HookJSONOutput, error) {
+//	    toolName := input["tool_name"].(string)
+//	    if toolName == "Bash" {
+//	        return HookJSONOutput{
+//	            HookSpecificOutput: map[string]interface{}{
+//	                "permissionDecision": "deny",
+//	                "permissionDecisionReason": "Bash tool is blocked",
+//	            },
+//	        }, nil
+//	    }
+//	    return HookJSONOutput{}, nil
+//	}
+//
+// Example - UserPromptSubmit hook to modify user input:
+//
+//	modifyPrompt := func(ctx context.Context, input map[string]interface{}, toolUseID *string, hookCtx HookContext) (HookJSONOutput, error) {
+//	    prompt := input["prompt"].(string)
+//	    enhanced := prompt + "\nPlease be concise in your response."
+//	    return HookJSONOutput{
+//	        HookSpecificOutput: map[string]interface{}{
+//	            "prompt": enhanced,
+//	        },
+//	    }, nil
+//	}
 type HookCallback func(ctx context.Context, input map[string]interface{}, toolUseID *string, hookCtx HookContext) (HookJSONOutput, error)
+
+// Strongly-typed hook input structs for type safety and better IDE support
+
+// BaseHookInput contains fields present across many hook events.
+type BaseHookInput struct {
+	SessionID      string  `json:"session_id"`
+	TranscriptPath string  `json:"transcript_path"`
+	Cwd            string  `json:"cwd"`
+	PermissionMode *string `json:"permission_mode,omitempty"`
+}
+
+// PreToolUseHookInput is the input data for PreToolUse hook events.
+type PreToolUseHookInput struct {
+	BaseHookInput
+	HookEventName string                 `json:"hook_event_name"` // "PreToolUse"
+	ToolName      string                 `json:"tool_name"`
+	ToolInput     map[string]interface{} `json:"tool_input"`
+}
+
+// PostToolUseHookInput is the input data for PostToolUse hook events.
+type PostToolUseHookInput struct {
+	BaseHookInput
+	HookEventName string                 `json:"hook_event_name"` // "PostToolUse"
+	ToolName      string                 `json:"tool_name"`
+	ToolInput     map[string]interface{} `json:"tool_input"`
+	ToolResponse  interface{}            `json:"tool_response"`
+}
+
+// UserPromptSubmitHookInput is the input data for UserPromptSubmit hook events.
+type UserPromptSubmitHookInput struct {
+	BaseHookInput
+	HookEventName string `json:"hook_event_name"` // "UserPromptSubmit"
+	Prompt        string `json:"prompt"`
+}
+
+// StopHookInput is the input data for Stop hook events.
+type StopHookInput struct {
+	BaseHookInput
+	HookEventName  string `json:"hook_event_name"` // "Stop"
+	StopHookActive bool   `json:"stop_hook_active"`
+}
+
+// SubagentStopHookInput is the input data for SubagentStop hook events.
+type SubagentStopHookInput struct {
+	BaseHookInput
+	HookEventName  string `json:"hook_event_name"` // "SubagentStop"
+	StopHookActive bool   `json:"stop_hook_active"`
+}
+
+// PreCompactHookInput is the input data for PreCompact hook events.
+type PreCompactHookInput struct {
+	BaseHookInput
+	HookEventName      string  `json:"hook_event_name"` // "PreCompact"
+	Trigger            string  `json:"trigger"`         // "manual" or "auto"
+	CustomInstructions *string `json:"custom_instructions,omitempty"`
+}
 
 // HookMatcher configures hook matching and callbacks.
 type HookMatcher struct {
@@ -284,6 +514,13 @@ func (c McpSdkServerConfig) MarshalJSON() ([]byte, error) {
 	})
 }
 
+// SdkPluginConfig represents a plugin configuration.
+// Currently only local plugins are supported via the 'local' type.
+type SdkPluginConfig struct {
+	Type string `json:"type"` // "local"
+	Path string `json:"path"` // Path to the plugin directory
+}
+
 // ClaudeAgentOptions contains all configuration options for Claude SDK.
 type ClaudeAgentOptions struct {
 	// Tool restrictions
@@ -307,7 +544,12 @@ type ClaudeAgentOptions struct {
 	ForkSession          bool    `json:"fork_session,omitempty"`
 
 	// Model
-	Model *string `json:"model,omitempty"`
+	Model         *string `json:"model,omitempty"`
+	FallbackModel *string `json:"fallback_model,omitempty"`
+
+	// Budget and token control
+	MaxBudgetUSD      *float64 `json:"max_budget_usd,omitempty"`
+	MaxThinkingTokens *int     `json:"max_thinking_tokens,omitempty"`
 
 	// Working directory and environment
 	Cwd     *string           `json:"cwd,omitempty"`
@@ -328,7 +570,12 @@ type ClaudeAgentOptions struct {
 	Agents map[string]AgentDefinition `json:"agents,omitempty"`
 
 	// Advanced options
-	IncludePartialMessages bool               `json:"include_partial_messages,omitempty"`
-	MaxBufferSize          *int               `json:"max_buffer_size,omitempty"`
-	ExtraArgs              map[string]*string `json:"extra_args,omitempty"` // nil value = flag without value
+	IncludePartialMessages   bool               `json:"include_partial_messages,omitempty"`
+	MaxBufferSize            *int               `json:"max_buffer_size,omitempty"` // Maximum buffer size for JSON messages (default: 10MB)
+	ScannerInitialBufferSize *int               `json:"-"`                         // Initial buffer size for scanner (default: 64KB, not sent to CLI)
+	MessageChannelBufferSize *int               `json:"-"`                         // Internal buffer size for message channels (default: 100, not sent to CLI)
+	ExtraArgs                map[string]*string `json:"extra_args,omitempty"`      // nil value = flag without value
+
+	// Plugins
+	Plugins []SdkPluginConfig `json:"plugins,omitempty"`
 }
